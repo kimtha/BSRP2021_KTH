@@ -1,0 +1,1058 @@
+---
+title: "Predicting_cancer_dependency_071921_KTH"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls()) #clear everything
+```
+
+
+```{r, echo=F, message=T}
+library(tidyverse)
+library(taigr)
+#install.packages("matrixStats")
+library(matrixStats)
+library(dplyr)
+#install.packages("glmnetUtils")
+library(glmnetUtils)
+#install.packages("broom")
+#install.packages("GGally")
+library(broom)
+library(GGally)
+#install.packages("glmnet")
+library(glmnet)
+#BiocManager::install("WGCNA") 
+library(WGCNA)
+```
+
+```{r echo=F, message=F}
+metadata = load.from.taiga(data.name='public-21q1-4b39', 
+                           data.version=33, 
+                           data.file='sample_info', 
+                           quiet = T)
+
+mutation = load.from.taiga(data.name = 'public-21q1-4b39',
+                            data.version = 33,
+                            data.file = 'CCLE_mutations',
+                            quiet = T)
+
+expression = load.from.taiga(data.name='public-21q1-4b39',
+                             data.version=33,
+                             data.file='CCLE_expression',
+                             quiet = T)
+colnames(expression) = stringr::word(colnames(expression), 1) 
+expression = as.data.frame(expression)
+expression$DepMap_ID = rownames(expression)
+
+dependency = load.from.taiga(data.name='public-21q1-4b39',
+                              data.version=33,
+                              data.file='CRISPR_gene_effect',
+                              quiet = T)
+colnames(dependency) = stringr::word(colnames(dependency), 1) 
+colnames(dependency) = paste(colnames(dependency), "_Dep", sep = "")
+colnames(dependency)[colnames(dependency) == "DepMap_ID_Dep"] = "DepMap_ID"
+dependency = as.data.frame(dependency)
+dependency$DepMap_ID = rownames(dependency)
+
+copy_number = load.from.taiga(data.name = 'public-21q1-4b39',
+                            data.version = 33,
+                            data.file = 'CCLE_gene_cn',
+                            quiet = T)
+colnames(copy_number) = stringr::word(colnames(copy_number), 1)
+copy_number = as.data.frame(copy_number)
+copy_number$DepMap_ID = rownames(copy_number)
+
+filtered.fusions <- load.from.taiga(data.name='gene-fusions-6212', data.version=22, data.file='filtered_fusions')
+```
+
+Week 5, 06.28.21 : Code for creating final mutation feature matrix
+```{r echo=T, message=F}
+no_silent_mutations_df = mutation[mutation$Variant_Classification != "Silent", ] #making a dataframe to include all mutation types except silent mutations
+
+no_silent_mutations_count_df = summarize(group_by(no_silent_mutations_df, DepMap_ID, Hugo_Symbol), N_mutation = n()) #this counts the number of non-silent mutations in each cell line for each gene
+
+###ignore this code, we don't need it for the matrix we want to make but maybe it'll come in handy later
+#joined_no_silent_mutations_count_df = left_join(no_silent_mutations_count_df, no_silent_mutations_df, "DepMap_ID") #joining mutation count dataframe with non-silent mutations dataframe to add columns back
+
+#joined_metadata_no_silent_mutations_count_df = full_join(no_silent_mutations_count_df, metadata, "DepMap_ID") #joining count of non-silent mutations dataframe with metadata
+
+#filtered_mutation_df = joined_metadata_no_silent_mutations_count_df[, c("DepMap_ID", "N_mutation", "Hugo_Symbol")] #subsetting dataframe for columns of interest
+###
+
+no_silent_mutations_count_df$gene_mutated = no_silent_mutations_count_df$N_mutation #adding a new column to indicate whether a cell line has a mutation in a gene or not
+
+no_silent_mutations_count_df$gene_mutated[no_silent_mutations_count_df$N_mutation >= 1] = 1 #this line makes it so that any mutation count equal to or greater than 1 is marked as 1
+
+no_silent_mutations_count_df$gene_mutated_2 =! is.na(no_silent_mutations_count_df$gene_mutated) #adding a column marking NA rows as FALSE
+
+filtered_mutation_df_subset_TRUE = no_silent_mutations_count_df[no_silent_mutations_count_df$gene_mutated_2 == "TRUE",] #getting rid of NA rows by subsetting for TRUE values only
+
+filtered_mutation_df_2 = filtered_mutation_df_subset_TRUE[, c("DepMap_ID", "gene_mutated", "Hugo_Symbol")] #subsetting for columns of interest before adding genes as new columns
+
+final_mutation_feature_df = tibble(filtered_mutation_df_2 %>% 
+  pivot_wider(
+    names_from = Hugo_Symbol, 
+    values_from = gene_mutated,
+    values_fill = 0
+  )) #making a table with mutated genes as columns, cell lines as rows, and each row contains the number of mutations within that gene
+#1 = non-silent mutation in gene, 0 = no mutation in gene
+
+#final_mutation_feature_df
+```
+
+Week 6, 07.08.21 : Practice training/testing models with 1-fold cross validation for KRAS using copy number omic feature
+```{r echo=T, message=F}
+#step 0a - dropping NA columns
+#is.na(copy_number) #identifying columns that have NA entries using logic function
+#colSums(is.na(copy_number)) #adding number of NAs in columns
+###no NAs so far
+
+#step 0b - standardizing values in copy number matrix
+copy_number$DepMap_ID = as.numeric(as.factor(copy_number$DepMap_ID)) #converting character vector, DepMap_ID, to numeric
+scaled_cn_df = scale(copy_number) #standardizing values
+scaled_cn_df = as.data.frame(scaled_cn_df) #turning scaled copy number data back into a dataframe
+
+scaled_cn_df$DepMap_ID = rownames(scaled_cn_df) #taking row names and putting them into a column named DepMap_ID
+
+#joining scaled cn dataframe with dependency dataframe
+joined_dependency_cn_df = inner_join(scaled_cn_df, dependency, "DepMap_ID")
+
+#checking for NAs - none that I can see
+is.na(joined_dependency_cn_df)
+colSums(is.na(joined_dependency_cn_df))
+
+###ignore these lines of code for now
+#making a dataframe with cn and KRAS dependency only
+#KRAS_dependency_df = dependency[, c("DepMap_ID", "KRAS_Dep")]
+#joined_KRAS_dependency_cn_df = inner_join(scaled_cn_df, KRAS_dependency_df, "DepMap_ID")
+###
+
+#finding index number for "KRAS_Dep" column, it's 35471
+grep("KRAS_Dep", colnames(joined_dependency_cn_df))
+
+#picking a subset of genes and including KRAS_Dep
+subset_1_joined_dependency_cn_df = joined_dependency_cn_df[, c(1:300, 35471)]
+
+#setting sample sizes for training and testing for KRAS
+set.seed(123)
+cn_training_1 = sample_n(subset_1_joined_dependency_cn_df, nrow(subset_1_joined_dependency_cn_df)*(2/3))
+cn_testing_1 = anti_join(subset_1_joined_dependency_cn_df, cn_training_1)
+
+#using training data to make the model
+cn_model1 = lm(KRAS_Dep ~ ., cn_training_1)
+summary(cn_model1)
+
+#predict given test dataframe
+prediction = predict(cn_model1, cn_testing_1)
+cn_testing_1$prediction = prediction
+
+#evaluate: pearson correlation: given test data vs. prediction from the model
+cor(prediction, cn_testing_1$KRAS_Dep)
+
+```
+
+
+Week 7, 07.12.21 : Practice training/testing models with 3-fold cross-validation for KRAS using copy number omic feature
+```{r echo=T, message=F}
+#step 0a - dropping NA columns
+#is.na(copy_number) #identifying columns that have NA entries using logic function
+#colSums(is.na(copy_number)) #adding number of NAs in columns
+###no NAs so far
+
+#step 0b - subsetting genes by finding variance for each column
+result = apply(X = copy_number, MARGIN = 2, FUN = var) #getting variance of every column in copy number matrix
+result[is.na(result)] = 0
+names(result) = names(copy_number) #explicitly assigning gene names to the variances
+cn_df_with_var = rbind(copy_number, result) #adding a variance row to the copy number matrix, the row is titled 1741 for some reason
+rownames(cn_df_with_var)[rownames(cn_df_with_var) == "1741"] = "variance" #re-naming row 1741 to say variance
+
+#new_cn_df_with_var = cn_df_with_var["variance", ] #making a new dataframe with only variance as a row
+#cn_gene_var_df = as.data.frame(t(new_cn_df_with_var)) #switching gene columns for rows and variance for column in a new dataframe
+#cn_gene_var_df$variance = as.numeric(as.character(cn_gene_var_df$variance)) #converting character type vector to numeric for variance column
+#cn_gene_var_df$gene = rownames(cn_gene_var_df) #taking row names and putting them into a column named gene
+
+#ggplot(cn_gene_var_df) + geom_histogram(aes(x = variance), binwidth = 0.01) + labs(x = "Variance", y = "Genes", title = "Comparison of variances across genes") #making a histogram to look at distribution of variances and select for the top 1000-2000 genes
+#summary(cn_gene_var_df) #median is 0.02941, 3rd quartile is 0.04118 so maybe we can start with that as a cutoff for subsetting genes and take the top fourth of variances
+
+subset_cn_df_with_var = cn_df_with_var[, cn_df_with_var["variance", ] >= 0.04118] #subset of 6874 genes aka top 25% of variances, use this!!
+subset_cn_df = subset_cn_df_with_var[1:1740, ] #filtering out variance as a row
+
+###another approach to sorting out genes with highest variances
+#require(data.table)
+#ordered_cn_gene_var_df = data.table(cn_gene_var_df, key="variance")
+#subset_cn_gene_var_df = ordered_cn_gene_var_df[, tail(.SD, 1000), by=variance] #ordering the variances in ascending order (won't do descending order for some reason), we can take the last few thousand rows to use as our predictor variables
+
+
+
+
+
+#step 0c - standardizing values in copy number matrix
+#copy_number$DepMap_ID = as.numeric(as.factor(copy_number$DepMap_ID)) #converting character vector, DepMap_ID, to numeric
+scaled_cn_df = scale(copy_number) #standardizing values
+scaled_cn_df = as.data.frame(scaled_cn_df) #turning scaled copy number data back into a dataframe
+
+scaled_cn_df$DepMap_ID = rownames(scaled_cn_df) #taking row names and putting them into a column named DepMap_ID
+
+#checking for NAs - none that I can see
+#is.na(joined_dependency_cn_df)
+#colSums(is.na(joined_dependency_cn_df))
+
+
+###ignore these lines of code for now
+#making a dataframe with scaled cn and KRAS dependency only
+KRAS_dependency_df = dependency[, c("DepMap_ID", "KRAS_Dep")]
+joined_KRAS_dependency_cn_df = inner_join(scaled_cn_df, KRAS_dependency_df, "DepMap_ID")
+final_joined_KRAS_dependency_cn_df = joined_KRAS_dependency_cn_df[, colnames(joined_KRAS_dependency_cn_df) != "DepMap_ID"]
+###
+
+
+
+
+###subsetting to get rid of highly correlated genes
+#picking a subset of genes with the first 624 genes, anything greater than 851 yields Nan...
+scaled_cn_df_filtered = scaled_cn_df[, 1:6874]
+no_depmap_scaled_cn_df = scaled_cn_df_filtered[, colnames(scaled_cn_df_filtered) != "DepMap_ID"]
+correlation = cor(no_depmap_scaled_cn_df, no_depmap_scaled_cn_df, use = "pairwise.complete.obs")
+
+correlation[!lower.tri(correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_cn_filtered = no_depmap_scaled_cn_df[, apply(correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#joining scaled cn dataframe with dependency dataframe
+correlation_cn_filtered$DepMap_ID = rownames(correlation_cn_filtered) #taking row names and putting them into a column named DepMap_ID
+joined_dependency_cn_df = inner_join(correlation_cn_filtered, dependency, "DepMap_ID")
+final_joined_dependency_cn_df = joined_dependency_cn_df[, colnames(joined_dependency_cn_df) != "DepMap_ID"] #throw out DepMap_ID column so that it's not being used as a predictor later on.
+
+###pick a gene to predict dependency on
+#finding index number for "KRAS_Dep" column, it's 9314
+grep("KRAS_Dep", colnames(final_joined_dependency_cn_df))
+#KRAS_final_joined_dependency_cn_df = final_joined_dependency_cn_df[, c(1:625, 9314)]
+
+
+###Testing and training with KRAS dependency!
+set.seed(123)
+joined_KRAS_dependency_cn_df_shuffled = joined_KRAS_dependency_cn_df[sample(1:nrow(KRAS_final_joined_dependency_cn_df)) ,]
+folds = cut(1:nrow(subset_KRAS_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+cn_training1 = subset_KRAS_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+cn_testing1 = subset_KRAS_dependency_cn_df_shuffled[folds == 3 ,]
+#model1 = lm(KRAS_Dep ~ ., cn_training1)
+#summary(model1)
+#model1_df = tidy(model1, conf.int = TRUE)
+#cn_testing1$KRAS_Dep_prediction = predict(model1, cn_testing1)
+y = cn_training1$KRAS_Dep #dependent variable
+x = as.matrix(select(cn_training1, -KRAS_Dep, -XXX)) #predictor variables
+cv_fit = cv.glmnet(x, y)
+coef(cv_fit)
+
+testing_x = as.matrix(select(cn_testing1, -XXX, -XXX))
+cn_testing1$KRAS_Dep_prediction =  predict(cv_fit, testing_x) 
+model1_eval = cor(cn_testing1$KRAS_Dep_prediction, cn_testing1$KRAS_Dep)
+
+#Second Round
+cn_training2 = subset_KRAS_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+cn_testing2 = subset_KRAS_dependency_cn_df_shuffled[folds == 1 ,]
+model2 = lm(KRAS_Dep ~ ., cn_training2)
+summary(model2)
+model2_df = tidy(model2, conf.int = TRUE)
+ggcoef(model2_df)
+cn_testing2$KRAS_Dep_prediction = predict(model2, cn_testing2)
+model2_eval = cor(cn_testing2$KRAS_Dep_prediction, cn_testing2$KRAS_Dep)
+
+#Third Round
+cn_training3 = subset_KRAS_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+cn_testing3 = subset_KRAS_dependency_cn_df_shuffled[folds == 2 ,]
+model3 = lm(KRAS_Dep ~ ., cn_training3)
+summary(model3)
+model3_df = tidy(model3, conf.int = TRUE)
+ggcoef(model3_df)
+cn_testing3$KRAS_Dep_prediction = predict(model3, cn_testing3)
+model3_eval = cor(cn_testing3$KRAS_Dep_prediction, cn_testing3$KRAS_Dep)
+
+model1_eval
+model2_eval
+model3_eval
+```
+
+Week 8, starting fresh with glmnet and KRAS
+```{r echo=T, message=F}
+#step 0a - standardizing values in copy number matrix
+copy_number$DepMap_ID = as.numeric(as.factor(copy_number$DepMap_ID)) #converting character vector, DepMap_ID, to numeric
+scaled_cn_df = scale(copy_number) #standardizing values
+scaled_cn_df = as.data.frame(scaled_cn_df) #turning scaled copy number data back into a dataframe
+scaled_cn_df$DepMap_ID = rownames(scaled_cn_df) #taking row names and putting them into a column named DepMap_ID
+
+#na_count = colSums(is.na(scaled_cn_df))
+#table(na_count > 0)
+#no_na_scaled_cn_df = scaled_cn_df[, na_count <= 0]
+
+#making a dataframe with scaled cn and KRAS dependency only
+KRAS_dependency_df = dependency[, c("DepMap_ID", "KRAS_Dep")]
+joined_KRAS_dependency_cn_df = inner_join(scaled_cn_df, KRAS_dependency_df, "DepMap_ID")
+final_joined_KRAS_dependency_cn_df = joined_KRAS_dependency_cn_df[, colnames(joined_KRAS_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+KRAS_correlation = WGCNA::cor(final_joined_KRAS_dependency_cn_df, final_joined_KRAS_dependency_cn_df, use = "pairwise.complete.obs")
+KRAS_correlation[!lower.tri(KRAS_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_KRAS_cn_filtered = final_joined_KRAS_dependency_cn_df[, apply(KRAS_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_KRAS_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_KRAS_dependency_cn_df = correlation_KRAS_cn_filtered[, na_count <= 0]
+
+###Testing and training with KRAS dependency!
+set.seed(123)
+no_na_final_joined_KRAS_dependency_cn_df_shuffled = no_na_final_joined_KRAS_dependency_cn_df[sample(1:nrow(no_na_final_joined_KRAS_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_KRAS_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+KRAS_cn_training1 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+KRAS_cn_testing1 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 3 ,]
+
+KRAS_y1 = KRAS_cn_training1$KRAS_Dep #dependent variable
+KRAS_x1 = as.matrix(select(KRAS_cn_training1, -KRAS_Dep)) #predictor variables
+KRAS_model1 = cv.glmnet(KRAS_x1, KRAS_y1)
+KRAS_model1_coef = as.matrix(coef(KRAS_model1))
+
+testing_KRAS_x1 = as.matrix(select(KRAS_cn_testing1, -KRAS_Dep))
+KRAS_cn_testing1$KRAS_Dep_prediction =  predict(KRAS_model1, testing_KRAS_x1) 
+KRAS_model1_eval = cor(KRAS_cn_testing1$KRAS_Dep_prediction, KRAS_cn_testing1$KRAS_Dep)
+
+KRAS_interesting_coef_1 = KRAS_model1_coef[KRAS_model1_coef[, 1] != 0  ,]
+
+#Second Round
+KRAS_cn_training2 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+KRAS_cn_testing2 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 2 ,]
+
+KRAS_y2 = KRAS_cn_training2$KRAS_Dep #dependent variable
+KRAS_x2 = as.matrix(select(KRAS_cn_training2, -KRAS_Dep)) #predictor variables
+KRAS_model2 = cv.glmnet(KRAS_x2, KRAS_y2)
+KRAS_model2_coef = as.matrix(coef(KRAS_model2))
+
+testing_KRAS_x2 = as.matrix(select(KRAS_cn_testing2, -KRAS_Dep))
+KRAS_cn_testing2$KRAS_Dep_prediction =  predict(KRAS_model2, testing_KRAS_x2) 
+KRAS_model2_eval = cor(KRAS_cn_testing2$KRAS_Dep_prediction, KRAS_cn_testing2$KRAS_Dep)
+
+KRAS_interesting_coef_2 = KRAS_model2_coef[KRAS_model2_coef[, 1] != 0  ,]
+
+#Third Round
+KRAS_cn_training3 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+KRAS_cn_testing3 = no_na_final_joined_KRAS_dependency_cn_df_shuffled[folds == 1 ,]
+
+KRAS_y3 = KRAS_cn_training3$KRAS_Dep #dependent variable
+KRAS_x3 = as.matrix(select(KRAS_cn_training3, -KRAS_Dep)) #predictor variables
+KRAS_model3 = cv.glmnet(KRAS_x3, KRAS_y3)
+KRAS_model3_coef = as.matrix(coef(KRAS_model3))
+
+testing_KRAS_x3 = as.matrix(select(KRAS_cn_testing3, -KRAS_Dep))
+KRAS_cn_testing3$KRAS_Dep_prediction =  predict(KRAS_model3, testing_KRAS_x3) 
+KRAS_model3_eval = cor(KRAS_cn_testing3$KRAS_Dep_prediction, KRAS_cn_testing3$KRAS_Dep)
+
+KRAS_interesting_coef_3 = KRAS_model3_coef[KRAS_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+KRAS_model1_eval
+KRAS_model2_eval
+KRAS_model3_eval
+KRAS_interesting_coef_1
+KRAS_interesting_coef_2
+KRAS_interesting_coef_3
+
+#making a scatterplot for model 1
+ggplot(KRAS_cn_testing1) + geom_point(aes(x = KRAS_Dep_prediction, y = KRAS_Dep)) + labs(x = "KRAS dependency prediction scores", y = "KRAS dependency", title = "Correlation between KRAS Dependency and Prediction for Model 1") + theme_classic()
+
+#making a scatterplot for model 2
+ggplot(KRAS_cn_testing2) + geom_point(aes(x = KRAS_Dep_prediction, y = KRAS_Dep)) + labs(x = "KRAS dependency prediction scores", y = "KRAS dependency", title = "Correlation between KRAS Dependency and Prediction for Model 2") + theme_classic() 
+
+png("KRAS_good_3", units="in", width=7, height=5, res=300)
+#making a scatterplot for model 3
+ggplot(KRAS_cn_testing3) + geom_point(aes(x = KRAS_Dep_prediction, y = KRAS_Dep)) + theme_classic() + geom_smooth(aes(KRAS_Dep_prediction, KRAS_Dep), method = "lm", se=F)
+dev.off()
+```
+
+3-fold model with TP53
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and TP53 dependency only
+TP53_dependency_df = dependency[, c("DepMap_ID", "TP53_Dep")]
+joined_TP53_dependency_cn_df = inner_join(scaled_cn_df, TP53_dependency_df, "DepMap_ID")
+final_joined_TP53_dependency_cn_df = joined_TP53_dependency_cn_df[, colnames(joined_TP53_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+TP53_correlation = WGCNA::cor(final_joined_TP53_dependency_cn_df, final_joined_TP53_dependency_cn_df, use = "pairwise.complete.obs")
+TP53_correlation[!lower.tri(TP53_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_TP53_cn_filtered = final_joined_TP53_dependency_cn_df[, apply(TP53_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_TP53_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_TP53_dependency_cn_df = correlation_TP53_cn_filtered[, na_count <= 0]
+
+###Testing and training with TP53 dependency!
+set.seed(123)
+no_na_final_joined_TP53_dependency_cn_df_shuffled = no_na_final_joined_TP53_dependency_cn_df[sample(1:nrow(no_na_final_joined_TP53_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_TP53_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+TP53_cn_training1 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+TP53_cn_testing1 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 3 ,]
+
+TP53_y1 = TP53_cn_training1$TP53_Dep #dependent variable
+TP53_x1 = as.matrix(select(TP53_cn_training1, -TP53_Dep)) #predictor variables
+TP53_model1 = cv.glmnet(TP53_x1, TP53_y1)
+TP53_model1_coef = as.matrix(coef(TP53_model1))
+
+testing_TP53_x1 = as.matrix(select(TP53_cn_testing1, -TP53_Dep))
+TP53_cn_testing1$TP53_Dep_prediction =  predict(TP53_model1, testing_TP53_x1) 
+TP53_model1_eval = cor(TP53_cn_testing1$TP53_Dep_prediction, TP53_cn_testing1$TP53_Dep)
+
+TP53_interesting_coef_1 = TP53_model1_coef[TP53_model1_coef[, 1] != 0  ,]
+
+#Second Round
+TP53_cn_training2 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+TP53_cn_testing2 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 2 ,]
+
+TP53_y2 = TP53_cn_training2$TP53_Dep #dependent variable
+TP53_x2 = as.matrix(select(TP53_cn_training2, -TP53_Dep)) #predictor variables
+TP53_model2 = cv.glmnet(TP53_x2, TP53_y2)
+TP53_model2_coef = as.matrix(coef(TP53_model2))
+
+testing_TP53_x2 = as.matrix(select(TP53_cn_testing2, -TP53_Dep))
+TP53_cn_testing2$TP53_Dep_prediction =  predict(TP53_model2, testing_TP53_x2) 
+TP53_model2_eval = cor(TP53_cn_testing2$TP53_Dep_prediction, TP53_cn_testing2$TP53_Dep)
+
+TP53_interesting_coef_2 = TP53_model2_coef[TP53_model2_coef[, 1] != 0  ,]
+
+#Third Round
+TP53_cn_training3 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+TP53_cn_testing3 = no_na_final_joined_TP53_dependency_cn_df_shuffled[folds == 1 ,]
+
+TP53_y3 = TP53_cn_training3$TP53_Dep #dependent variable
+TP53_x3 = as.matrix(select(TP53_cn_training3, -TP53_Dep)) #predictor variables
+TP53_model3 = cv.glmnet(TP53_x3, TP53_y3)
+TP53_model3_coef = as.matrix(coef(TP53_model3))
+
+testing_TP53_x3 = as.matrix(select(TP53_cn_testing3, -TP53_Dep))
+TP53_cn_testing3$TP53_Dep_prediction =  predict(TP53_model3, testing_TP53_x3) 
+TP53_model3_eval = cor(TP53_cn_testing3$TP53_Dep_prediction, TP53_cn_testing3$TP53_Dep)
+
+TP53_interesting_coef_3 = TP53_model3_coef[TP53_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+TP53_model1_eval
+TP53_model2_eval
+TP53_model3_eval
+TP53_interesting_coef_1
+TP53_interesting_coef_2
+TP53_interesting_coef_3
+```
+
+3-fold model with AKT1
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and AKT1 dependency only
+AKT1_dependency_df = dependency[, c("DepMap_ID", "AKT1_Dep")]
+joined_AKT1_dependency_cn_df = inner_join(scaled_cn_df, AKT1_dependency_df, "DepMap_ID")
+final_joined_AKT1_dependency_cn_df = joined_AKT1_dependency_cn_df[, colnames(joined_AKT1_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+AKT1_correlation = WGCNA::cor(final_joined_AKT1_dependency_cn_df, final_joined_AKT1_dependency_cn_df, use = "pairwise.complete.obs")
+AKT1_correlation[!lower.tri(AKT1_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_AKT1_cn_filtered = final_joined_AKT1_dependency_cn_df[, apply(AKT1_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_AKT1_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_AKT1_dependency_cn_df = correlation_AKT1_cn_filtered[, na_count <= 0]
+
+###Testing and training with AKT1 dependency!
+set.seed(123)
+no_na_final_joined_AKT1_dependency_cn_df_shuffled = no_na_final_joined_AKT1_dependency_cn_df[sample(1:nrow(no_na_final_joined_AKT1_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_AKT1_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+AKT1_cn_training1 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+AKT1_cn_testing1 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 3 ,]
+
+AKT1_y1 = AKT1_cn_training1$AKT1_Dep #dependent variable
+AKT1_x1 = as.matrix(select(AKT1_cn_training1, -AKT1_Dep)) #predictor variables
+AKT1_model1 = cv.glmnet(AKT1_x1, AKT1_y1)
+AKT1_model1_coef = as.matrix(coef(AKT1_model1))
+
+testing_AKT1_x1 = as.matrix(select(AKT1_cn_testing1, -AKT1_Dep))
+AKT1_cn_testing1$AKT1_Dep_prediction =  predict(AKT1_model1, testing_AKT1_x1) 
+AKT1_model1_eval = cor(AKT1_cn_testing1$AKT1_Dep_prediction, AKT1_cn_testing1$AKT1_Dep)
+
+AKT1_interesting_coef_1 = AKT1_model1_coef[AKT1_model1_coef[, 1] != 0  ,]
+
+#Second Round
+AKT1_cn_training2 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+AKT1_cn_testing2 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 2 ,]
+
+AKT1_y2 = AKT1_cn_training2$AKT1_Dep #dependent variable
+AKT1_x2 = as.matrix(select(AKT1_cn_training2, -AKT1_Dep)) #predictor variables
+AKT1_model2 = cv.glmnet(AKT1_x2, AKT1_y2)
+AKT1_model2_coef = as.matrix(coef(AKT1_model2))
+
+testing_AKT1_x2 = as.matrix(select(AKT1_cn_testing2, -AKT1_Dep))
+AKT1_cn_testing2$AKT1_Dep_prediction =  predict(AKT1_model2, testing_AKT1_x2) 
+AKT1_model2_eval = cor(AKT1_cn_testing2$AKT1_Dep_prediction, AKT1_cn_testing2$AKT1_Dep)
+
+AKT1_interesting_coef_2 = AKT1_model2_coef[AKT1_model2_coef[, 1] != 0  ,]
+
+#Third Round
+AKT1_cn_training3 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+AKT1_cn_testing3 = no_na_final_joined_AKT1_dependency_cn_df_shuffled[folds == 1 ,]
+
+AKT1_y3 = AKT1_cn_training3$AKT1_Dep #dependent variable
+AKT1_x3 = as.matrix(select(AKT1_cn_training3, -AKT1_Dep)) #predictor variables
+AKT1_model3 = cv.glmnet(AKT1_x3, AKT1_y3)
+AKT1_model3_coef = as.matrix(coef(AKT1_model3))
+
+testing_AKT1_x3 = as.matrix(select(AKT1_cn_testing3, -AKT1_Dep))
+AKT1_cn_testing3$AKT1_Dep_prediction =  predict(AKT1_model3, testing_AKT1_x3) 
+AKT1_model3_eval = cor(AKT1_cn_testing3$AKT1_Dep_prediction, AKT1_cn_testing3$AKT1_Dep)
+
+AKT1_interesting_coef_3 = AKT1_model3_coef[AKT1_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+AKT1_model1_eval
+AKT1_model2_eval
+AKT1_model3_eval
+AKT1_interesting_coef_1
+AKT1_interesting_coef_2
+AKT1_interesting_coef_3
+```
+
+3-fold model with EGFR
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and EGFR dependency only
+EGFR_dependency_df = dependency[, c("DepMap_ID", "EGFR_Dep")]
+joined_EGFR_dependency_cn_df = inner_join(scaled_cn_df, EGFR_dependency_df, "DepMap_ID")
+final_joined_EGFR_dependency_cn_df = joined_EGFR_dependency_cn_df[, colnames(joined_EGFR_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+EGFR_correlation = WGCNA::cor(final_joined_EGFR_dependency_cn_df, final_joined_EGFR_dependency_cn_df, use = "pairwise.complete.obs")
+EGFR_correlation[!lower.tri(EGFR_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_EGFR_cn_filtered = final_joined_EGFR_dependency_cn_df[, apply(EGFR_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_EGFR_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_EGFR_dependency_cn_df = correlation_EGFR_cn_filtered[, na_count <= 0]
+
+###Testing and training with EGFR dependency!
+set.seed(123)
+no_na_final_joined_EGFR_dependency_cn_df_shuffled = no_na_final_joined_EGFR_dependency_cn_df[sample(1:nrow(no_na_final_joined_EGFR_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_EGFR_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+EGFR_cn_training1 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+EGFR_cn_testing1 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 3 ,]
+
+EGFR_y1 = EGFR_cn_training1$EGFR_Dep #dependent variable
+EGFR_x1 = as.matrix(select(EGFR_cn_training1, -EGFR_Dep)) #predictor variables
+EGFR_model1 = cv.glmnet(EGFR_x1, EGFR_y1)
+EGFR_model1_coef = as.matrix(coef(EGFR_model1))
+
+testing_EGFR_x1 = as.matrix(select(EGFR_cn_testing1, -EGFR_Dep))
+EGFR_cn_testing1$EGFR_Dep_prediction =  predict(EGFR_model1, testing_EGFR_x1) 
+EGFR_model1_eval = cor(EGFR_cn_testing1$EGFR_Dep_prediction, EGFR_cn_testing1$EGFR_Dep)
+
+EGFR_interesting_coef_1 = EGFR_model1_coef[EGFR_model1_coef[, 1] != 0  ,]
+
+#Second Round
+EGFR_cn_training2 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+EGFR_cn_testing2 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 2 ,]
+
+EGFR_y2 = EGFR_cn_training2$EGFR_Dep #dependent variable
+EGFR_x2 = as.matrix(select(EGFR_cn_training2, -EGFR_Dep)) #predictor variables
+EGFR_model2 = cv.glmnet(EGFR_x2, EGFR_y2)
+EGFR_model2_coef = as.matrix(coef(EGFR_model2))
+
+testing_EGFR_x2 = as.matrix(select(EGFR_cn_testing2, -EGFR_Dep))
+EGFR_cn_testing2$EGFR_Dep_prediction =  predict(EGFR_model2, testing_EGFR_x2) 
+EGFR_model2_eval = cor(EGFR_cn_testing2$EGFR_Dep_prediction, EGFR_cn_testing2$EGFR_Dep)
+
+EGFR_interesting_coef_2 = EGFR_model2_coef[EGFR_model2_coef[, 1] != 0  ,]
+
+#Third Round
+EGFR_cn_training3 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+EGFR_cn_testing3 = no_na_final_joined_EGFR_dependency_cn_df_shuffled[folds == 1 ,]
+
+EGFR_y3 = EGFR_cn_training3$EGFR_Dep #dependent variable
+EGFR_x3 = as.matrix(select(EGFR_cn_training3, -EGFR_Dep)) #predictor variables
+EGFR_model3 = cv.glmnet(EGFR_x3, EGFR_y3)
+EGFR_model3_coef = as.matrix(coef(EGFR_model3))
+
+testing_EGFR_x3 = as.matrix(select(EGFR_cn_testing3, -EGFR_Dep))
+EGFR_cn_testing3$EGFR_Dep_prediction =  predict(EGFR_model3, testing_EGFR_x3) 
+EGFR_model3_eval = cor(EGFR_cn_testing3$EGFR_Dep_prediction, EGFR_cn_testing3$EGFR_Dep)
+
+EGFR_interesting_coef_3 = EGFR_model3_coef[EGFR_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+EGFR_model1_eval
+EGFR_model2_eval
+EGFR_model3_eval
+EGFR_interesting_coef_1
+EGFR_interesting_coef_2
+EGFR_interesting_coef_3
+```
+
+3-fold model with CDK9 - can't predict because the column gets dropped...
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and CDK9 dependency only
+CDK9_dependency_df = dependency[, c("DepMap_ID", "CDK9_Dep")]
+joined_CDK9_dependency_cn_df = inner_join(scaled_cn_df, CDK9_dependency_df, "DepMap_ID")
+final_joined_CDK9_dependency_cn_df = joined_CDK9_dependency_cn_df[, colnames(joined_CDK9_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+CDK9_correlation = WGCNA::cor(final_joined_CDK9_dependency_cn_df, final_joined_CDK9_dependency_cn_df, use = "pairwise.complete.obs")
+CDK9_correlation[!lower.tri(CDK9_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_CDK9_cn_filtered = final_joined_CDK9_dependency_cn_df[, apply(CDK9_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_CDK9_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_CDK9_dependency_cn_df = correlation_CDK9_cn_filtered[, na_count <= 0]
+
+###Testing and training with CDK9 dependency!
+set.seed(123)
+no_na_final_joined_CDK9_dependency_cn_df_shuffled = no_na_final_joined_CDK9_dependency_cn_df[sample(1:nrow(no_na_final_joined_CDK9_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_CDK9_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+CDK9_cn_training1 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+CDK9_cn_testing1 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 3 ,]
+
+CDK9_y1 = CDK9_cn_training1$CDK9_Dep #dependent variable
+CDK9_x1 = as.matrix(select(CDK9_cn_training1, -CDK9_Dep)) #predictor variables
+CDK9_model1 = cv.glmnet(CDK9_x1, CDK9_y1)
+CDK9_model1_coef = as.matrix(coef(CDK9_model1))
+
+testing_CDK9_x1 = as.matrix(select(CDK9_cn_testing1, -CDK9_Dep))
+CDK9_cn_testing1$CDK9_Dep_prediction =  predict(CDK9_model1, testing_CDK9_x1) 
+CDK9_model1_eval = cor(CDK9_cn_testing1$CDK9_Dep_prediction, CDK9_cn_testing1$CDK9_Dep)
+
+CDK9_interesting_coef_1 = CDK9_model1_coef[CDK9_model1_coef[, 1] != 0  ,]
+
+#Second Round
+CDK9_cn_training2 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+CDK9_cn_testing2 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 2 ,]
+
+CDK9_y2 = CDK9_cn_training2$CDK9_Dep #dependent variable
+CDK9_x2 = as.matrix(select(CDK9_cn_training2, -CDK9_Dep)) #predictor variables
+CDK9_model2 = cv.glmnet(CDK9_x2, CDK9_y2)
+CDK9_model2_coef = as.matrix(coef(CDK9_model2))
+
+testing_CDK9_x2 = as.matrix(select(CDK9_cn_testing2, -CDK9_Dep))
+CDK9_cn_testing2$CDK9_Dep_prediction =  predict(CDK9_model2, testing_CDK9_x2) 
+CDK9_model2_eval = cor(CDK9_cn_testing2$CDK9_Dep_prediction, CDK9_cn_testing2$CDK9_Dep)
+
+CDK9_interesting_coef_2 = CDK9_model2_coef[CDK9_model2_coef[, 1] != 0  ,]
+
+#Third Round
+CDK9_cn_training3 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+CDK9_cn_testing3 = no_na_final_joined_CDK9_dependency_cn_df_shuffled[folds == 1 ,]
+
+CDK9_y3 = CDK9_cn_training3$CDK9_Dep #dependent variable
+CDK9_x3 = as.matrix(select(CDK9_cn_training3, -CDK9_Dep)) #predictor variables
+CDK9_model3 = cv.glmnet(CDK9_x3, CDK9_y3)
+CDK9_model3_coef = as.matrix(coef(CDK9_model3))
+
+testing_CDK9_x3 = as.matrix(select(CDK9_cn_testing3, -CDK9_Dep))
+CDK9_cn_testing3$CDK9_Dep_prediction =  predict(CDK9_model3, testing_CDK9_x3) 
+CDK9_model3_eval = cor(CDK9_cn_testing3$CDK9_Dep_prediction, CDK9_cn_testing3$CDK9_Dep)
+
+CDK9_interesting_coef_3 = CDK9_model3_coef[CDK9_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+CDK9_model1_eval
+CDK9_model2_eval
+CDK9_model3_eval
+CDK9_interesting_coef_1
+CDK9_interesting_coef_2
+CDK9_interesting_coef_3
+```
+
+3-fold model with CDKN2A - can't predict because the column gets dropped...
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and CDKN2A dependency only
+CDKN2A_dependency_df = dependency[, c("DepMap_ID", "CDKN2A_Dep")]
+joined_CDKN2A_dependency_cn_df = inner_join(scaled_cn_df, CDKN2A_dependency_df, "DepMap_ID")
+final_joined_CDKN2A_dependency_cn_df = joined_CDKN2A_dependency_cn_df[, colnames(joined_CDKN2A_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+CDKN2A_correlation = WGCNA::cor(final_joined_CDKN2A_dependency_cn_df, final_joined_CDKN2A_dependency_cn_df, use = "pairwise.complete.obs")
+CDK2NA_correlation[!lower.tri(CDKN2A_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_CDKN2A_cn_filtered = final_joined_CDKN2A_dependency_cn_df[, apply(CDKN2A_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_CDKN2A_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_CDKN2A_dependency_cn_df = correlation_CDKN2A_cn_filtered[, na_count <= 0]
+
+###Testing and training with CDKN2A dependency!
+set.seed(123)
+no_na_final_joined_CDKN2A_dependency_cn_df_shuffled = no_na_final_joined_CDKN2A_dependency_cn_df[sample(1:nrow(no_na_final_joined_CDKN2A_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_CDKN2A_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+CDKN2A_cn_training1 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+CDKN2A_cn_testing1 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 3 ,]
+
+CDKN2A_y1 = CDKN2A_cn_training1$CDKN2A_Dep #dependent variable
+CDKN2A_x1 = as.matrix(select(CDKN2A_cn_training1, -CDKN2A_Dep)) #predictor variables
+CDKN2A_model1 = cv.glmnet(CDKN2A_x1, CDKN2A_y1)
+CDKN2A_model1_coef = as.matrix(coef(CDKN2A_model1))
+
+testing_CDKN2A_x1 = as.matrix(select(CDKN2A_cn_testing1, -CDKN2A_Dep))
+CDKN2A_cn_testing1$CDKN2A_Dep_prediction =  predict(CDKN2A_model1, testing_CDKN2A_x1) 
+CDKN2A_model1_eval = cor(CDKN2A_cn_testing1$CDKN2A_Dep_prediction, CDKN2A_cn_testing1$CDKN2A_Dep)
+
+CDKN2A_interesting_coef_1 = CDKN2A_model1_coef[CDKN2A_model1_coef[, 1] != 0  ,]
+
+#Second Round
+CDKN2A_cn_training2 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+CDKN2A_cn_testing2 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 2 ,]
+
+CDKN2A_y2 = CDKN2A_cn_training2$CDKN2A_Dep #dependent variable
+CDKN2A_x2 = as.matrix(select(CDKN2A_cn_training2, -CDKN2A_Dep)) #predictor variables
+CDKN2A_model2 = cv.glmnet(CDKN2A_x2, CDKN2A_y2)
+CDKN2A_model2_coef = as.matrix(coef(CDKN2A_model2))
+
+testing_CDKN2A_x2 = as.matrix(select(CDKN2A_cn_testing2, -CDKN2A_Dep))
+CDKN2A_cn_testing2$CDKN2A_Dep_prediction =  predict(CDKN2A_model2, testing_CDKN2A_x2) 
+CDKN2A_model2_eval = cor(CDKN2A_cn_testing2$CDKN2A_Dep_prediction, CDKN2A_cn_testing2$CDKN2A_Dep)
+
+CDKN2A_interesting_coef_2 = CDKN2A_model2_coef[CDKN2A_model2_coef[, 1] != 0  ,]
+
+#Third Round
+CDKN2A_cn_training3 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+CDKN2A_cn_testing3 = no_na_final_joined_CDKN2A_dependency_cn_df_shuffled[folds == 1 ,]
+
+CDKN2A_y3 = CDKN2A_cn_training3$CDKN2A_Dep #dependent variable
+CDKN2A_x3 = as.matrix(select(CDKN2A_cn_training3, -CDKN2A_Dep)) #predictor variables
+CDKN2A_model3 = cv.glmnet(CDKN2A_x3, CDKN2A_y3)
+CDKN2A_model3_coef = as.matrix(coef(CDKN2A_model3))
+
+testing_CDKN2A_x3 = as.matrix(select(CDKN2A_cn_testing3, -CDKN2A_Dep))
+CDKN2A_cn_testing3$CDKN2A_Dep_prediction =  predict(CDKN2A_model3, testing_CDKN2A_x3) 
+CDKN2A_model3_eval = cor(CDKN2A_cn_testing3$CDKN2A_Dep_prediction, CDKN2A_cn_testing3$CDKN2A_Dep)
+
+CDKN2A_interesting_coef_3 = CDKN2A_model3_coef[CDKN2A_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+CDKN2A_model1_eval
+CDKN2A_model2_eval
+CDKN2A_model3_eval
+CDKN2A_interesting_coef_1
+CDKN2A_interesting_coef_2
+CDKN2A_interesting_coef_3
+```
+
+3-fold model with RB1 - can't predict because the column gets dropped..., can I get rid of NA rows?
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and RB1 dependency only
+RB1_dependency_df = dependency[, c("DepMap_ID", "RB1_Dep")]
+joined_RB1_dependency_cn_df = inner_join(scaled_cn_df, RB1_dependency_df, "DepMap_ID")
+final_joined_RB1_dependency_cn_df = joined_RB1_dependency_cn_df[, colnames(joined_RB1_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+RB1_correlation = WGCNA::cor(final_joined_RB1_dependency_cn_df, final_joined_RB1_dependency_cn_df, use = "pairwise.complete.obs")
+RB1_correlation[!lower.tri(RB1_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_RB1_cn_filtered = final_joined_RB1_dependency_cn_df[, apply(RB1_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_RB1_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_RB1_dependency_cn_df = correlation_RB1_cn_filtered[, na_count <= 0]
+
+###Testing and training with RB1 dependency!
+set.seed(123)
+no_na_final_joined_RB1_dependency_cn_df_shuffled = no_na_final_joined_RB1_dependency_cn_df[sample(1:nrow(no_na_final_joined_RB1_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_RB1_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+RB1_cn_training1 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+RB1_cn_testing1 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 3 ,]
+
+RB1_y1 = RB1_cn_training1$RB1_Dep #dependent variable
+RB1_x1 = as.matrix(select(RB1_cn_training1, -RB1_Dep)) #predictor variables
+RB1_model1 = cv.glmnet(RB1_x1, RB1_y1)
+RB1_model1_coef = as.matrix(coef(RB1_model1))
+
+testing_RB1_x1 = as.matrix(select(RB1_cn_testing1, -RB1_Dep))
+RB1_cn_testing1$RB1_Dep_prediction =  predict(RB1_model1, testing_RB1_x1) 
+RB1_model1_eval = cor(RB1_cn_testing1$RB1_Dep_prediction, RB1_cn_testing1$RB1_Dep)
+
+RB1_interesting_coef_1 = RB1_model1_coef[RB1_model1_coef[, 1] != 0  ,]
+
+#Second Round
+RB1_cn_training2 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+RB1_cn_testing2 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 2 ,]
+
+RB1_y2 = RB1_cn_training2$RB1_Dep #dependent variable
+RB1_x2 = as.matrix(select(RB1_cn_training2, -RB1_Dep)) #predictor variables
+RB1_model2 = cv.glmnet(RB1_x2, RB1_y2)
+RB1_model2_coef = as.matrix(coef(RB1_model2))
+
+testing_RB1_x2 = as.matrix(select(RB1_cn_testing2, -RB1_Dep))
+RB1_cn_testing2$RB1_Dep_prediction =  predict(RB1_model2, testing_RB1_x2) 
+RB1_model2_eval = cor(RB1_cn_testing2$RB1_Dep_prediction, RB1_cn_testing2$RB1_Dep)
+
+RB1_interesting_coef_2 = RB1_model2_coef[RB1_model2_coef[, 1] != 0  ,]
+
+#Third Round
+RB1_cn_training3 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+RB1_cn_testing3 = no_na_final_joined_RB1_dependency_cn_df_shuffled[folds == 1 ,]
+
+RB1_y3 = RB1_cn_training3$RB1_Dep #dependent variable
+RB1_x3 = as.matrix(select(RB1_cn_training3, -RB1_Dep)) #predictor variables
+RB1_model3 = cv.glmnet(RB1_x3, RB1_y3)
+RB1_model3_coef = as.matrix(coef(RB1_model3))
+
+testing_RB1_x3 = as.matrix(select(RB1_cn_testing3, -RB1_Dep))
+RB1_cn_testing3$RB1_Dep_prediction =  predict(RB1_model3, testing_RB1_x3) 
+RB1_model3_eval = cor(RB1_cn_testing3$RB1_Dep_prediction, RB1_cn_testing3$RB1_Dep)
+
+RB1_interesting_coef_3 = RB1_model3_coef[RB1_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+RB1_model1_eval
+RB1_model2_eval
+RB1_model3_eval
+RB1_interesting_coef_1
+RB1_interesting_coef_2
+RB1_interesting_coef_3
+```
+
+3-fold model with PTEN - bad model
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and PTEN dependency only
+PTEN_dependency_df = dependency[, c("DepMap_ID", "PTEN_Dep")]
+joined_PTEN_dependency_cn_df = inner_join(scaled_cn_df, PTEN_dependency_df, "DepMap_ID")
+final_joined_PTEN_dependency_cn_df = joined_PTEN_dependency_cn_df[, colnames(joined_PTEN_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+PTEN_correlation = WGCNA::cor(final_joined_PTEN_dependency_cn_df, final_joined_PTEN_dependency_cn_df, use = "pairwise.complete.obs")
+PTEN_correlation[!lower.tri(PTEN_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_PTEN_cn_filtered = final_joined_PTEN_dependency_cn_df[, apply(PTEN_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_PTEN_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_PTEN_dependency_cn_df = correlation_PTEN_cn_filtered[, na_count <= 0]
+
+###Testing and training with PTEN dependency!
+set.seed(123)
+no_na_final_joined_PTEN_dependency_cn_df_shuffled = no_na_final_joined_PTEN_dependency_cn_df[sample(1:nrow(no_na_final_joined_PTEN_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_PTEN_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+PTEN_cn_training1 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+PTEN_cn_testing1 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 3 ,]
+
+PTEN_y1 = PTEN_cn_training1$PTEN_Dep #dependent variable
+PTEN_x1 = as.matrix(select(PTEN_cn_training1, -PTEN_Dep)) #predictor variables
+PTEN_model1 = cv.glmnet(PTEN_x1, PTEN_y1)
+PTEN_model1_coef = as.matrix(coef(PTEN_model1))
+
+testing_PTEN_x1 = as.matrix(select(PTEN_cn_testing1, -PTEN_Dep))
+PTEN_cn_testing1$PTEN_Dep_prediction =  predict(PTEN_model1, testing_PTEN_x1) 
+PTEN_model1_eval = cor(PTEN_cn_testing1$PTEN_Dep_prediction, PTEN_cn_testing1$PTEN_Dep)
+
+PTEN_interesting_coef_1 = PTEN_model1_coef[PTEN_model1_coef[, 1] != 0  ,]
+
+#Second Round
+PTEN_cn_training2 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+PTEN_cn_testing2 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 2 ,]
+
+PTEN_y2 = PTEN_cn_training2$PTEN_Dep #dependent variable
+PTEN_x2 = as.matrix(select(PTEN_cn_training2, -PTEN_Dep)) #predictor variables
+PTEN_model2 = cv.glmnet(PTEN_x2, PTEN_y2)
+PTEN_model2_coef = as.matrix(coef(PTEN_model2))
+
+testing_PTEN_x2 = as.matrix(select(PTEN_cn_testing2, -PTEN_Dep))
+PTEN_cn_testing2$PTEN_Dep_prediction =  predict(PTEN_model2, testing_PTEN_x2) 
+PTEN_model2_eval = cor(PTEN_cn_testing2$PTEN_Dep_prediction, PTEN_cn_testing2$PTEN_Dep)
+
+PTEN_interesting_coef_2 = PTEN_model2_coef[PTEN_model2_coef[, 1] != 0  ,]
+
+#Third Round
+PTEN_cn_training3 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+PTEN_cn_testing3 = no_na_final_joined_PTEN_dependency_cn_df_shuffled[folds == 1 ,]
+
+PTEN_y3 = PTEN_cn_training3$PTEN_Dep #dependent variable
+PTEN_x3 = as.matrix(select(PTEN_cn_training3, -PTEN_Dep)) #predictor variables
+PTEN_model3 = cv.glmnet(PTEN_x3, PTEN_y3)
+PTEN_model3_coef = as.matrix(coef(PTEN_model3))
+
+testing_PTEN_x3 = as.matrix(select(PTEN_cn_testing3, -PTEN_Dep))
+PTEN_cn_testing3$PTEN_Dep_prediction =  predict(PTEN_model3, testing_PTEN_x3) 
+PTEN_model3_eval = cor(PTEN_cn_testing3$PTEN_Dep_prediction, PTEN_cn_testing3$PTEN_Dep)
+
+PTEN_interesting_coef_3 = PTEN_model3_coef[PTEN_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+PTEN_model1_eval
+PTEN_model2_eval
+PTEN_model3_eval
+PTEN_interesting_coef_1
+PTEN_interesting_coef_2
+PTEN_interesting_coef_3
+```
+
+3-fold model with MYC - MYC_Dep column doesn't exist
+```{r echo=T, message=F}
+#making a dataframe with scaled cn and MYC dependency only
+MYC_dependency_df = dependency[, c("DepMap_ID", "MYC_Dep")]
+joined_MYC_dependency_cn_df = inner_join(scaled_cn_df, MYC_dependency_df, "DepMap_ID")
+final_joined_MYC_dependency_cn_df = joined_MYC_dependency_cn_df[, colnames(joined_MYC_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+MYC_correlation = WGCNA::cor(final_joined_MYC_dependency_cn_df, final_joined_MYC_dependency_cn_df, use = "pairwise.complete.obs")
+MYC_correlation[!lower.tri(MYC_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_MYC_cn_filtered = final_joined_MYC_dependency_cn_df[, apply(MYC_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_MYC_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_MYC_dependency_cn_df = correlation_MYC_cn_filtered[, na_count <= 0]
+
+###Testing and training with MYC dependency!
+set.seed(123)
+no_na_final_joined_MYC_dependency_cn_df_shuffled = no_na_final_joined_MYC_dependency_cn_df[sample(1:nrow(no_na_final_joined_MYC_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_MYC_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+MYC_cn_training1 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+MYC_cn_testing1 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 3 ,]
+
+MYC_y1 = MYC_cn_training1$MYC_Dep #dependent variable
+MYC_x1 = as.matrix(select(MYC_cn_training1, -MYC_Dep)) #predictor variables
+MYC_model1 = cv.glmnet(MYC_x1, MYC_y1)
+MYC_model1_coef = as.matrix(coef(MYC_model1))
+
+testing_MYC_x1 = as.matrix(select(MYC_cn_testing1, -MYC_Dep))
+MYC_cn_testing1$MYC_Dep_prediction =  predict(MYC_model1, testing_MYC_x1) 
+MYC_model1_eval = cor(MYC_cn_testing1$MYC_Dep_prediction, MYC_cn_testing1$MYC_Dep)
+
+MYC_interesting_coef_1 = MYC_model1_coef[MYC_model1_coef[, 1] != 0  ,]
+
+#Second Round
+MYC_cn_training2 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+MYC_cn_testing2 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 2 ,]
+
+MYC_y2 = MYC_cn_training2$MYC_Dep #dependent variable
+MYC_x2 = as.matrix(select(MYC_cn_training2, -MYC_Dep)) #predictor variables
+MYC_model2 = cv.glmnet(MYC_x2, MYC_y2)
+MYC_model2_coef = as.matrix(coef(MYC_model2))
+
+testing_MYC_x2 = as.matrix(select(MYC_cn_testing2, -MYC_Dep))
+MYC_cn_testing2$MYC_Dep_prediction =  predict(MYC_model2, testing_MYC_x2) 
+MYC_model2_eval = cor(MYC_cn_testing2$MYC_Dep_prediction, MYC_cn_testing2$MYC_Dep)
+
+MYC_interesting_coef_2 = MYC_model2_coef[MYC_model2_coef[, 1] != 0  ,]
+
+#Third Round
+MYC_cn_training3 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+MYC_cn_testing3 = no_na_final_joined_MYC_dependency_cn_df_shuffled[folds == 1 ,]
+
+MYC_y3 = MYC_cn_training3$MYC_Dep #dependent variable
+MYC_x3 = as.matrix(select(MYC_cn_training3, -MYC_Dep)) #predictor variables
+MYC_model3 = cv.glmnet(MYC_x3, MYC_y3)
+MYC_model3_coef = as.matrix(coef(MYC_model3))
+
+testing_MYC_x3 = as.matrix(select(MYC_cn_testing3, -MYC_Dep))
+MYC_cn_testing3$MYC_Dep_prediction =  predict(MYC_model3, testing_MYC_x3) 
+MYC_model3_eval = cor(MYC_cn_testing3$MYC_Dep_prediction, MYC_cn_testing3$MYC_Dep)
+
+MYC_interesting_coef_3 = MYC_model3_coef[MYC_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+MYC_model1_eval
+MYC_model2_eval
+MYC_model3_eval
+MYC_interesting_coef_1
+MYC_interesting_coef_2
+MYC_interesting_coef_3
+```
+
+3-fold model with MDM2 - column doesn't exist
+```{r echo=T, message=FALSE}
+#making a dataframe with scaled cn and MDM2 dependency only
+MDM2_dependency_df = dependency[, c("DepMap_ID", "MDM2_Dep")]
+joined_MDM2_dependency_cn_df = inner_join(scaled_cn_df, MDM2_dependency_df, "DepMap_ID")
+final_joined_MDM2_dependency_cn_df = joined_MDM2_dependency_cn_df[, colnames(joined_MDM2_dependency_cn_df) != "DepMap_ID"]
+
+#getting rid of highly correlated genes
+MDM2_correlation = WGCNA::cor(final_joined_MDM2_dependency_cn_df, final_joined_MDM2_dependency_cn_df, use = "pairwise.complete.obs")
+MDM2_correlation[!lower.tri(MDM2_correlation)] = 0 #trick with triangular matrices to filter out only one feature, not both
+correlation_MDM2_cn_filtered = final_joined_MDM2_dependency_cn_df[, apply(MDM2_correlation, 2, function(x) all(abs(x) < 0.97))] #keep features below .97 correlation
+
+#dropping NA columns
+na_count = colSums(is.na(correlation_MDM2_cn_filtered))
+table(na_count > 0)
+no_na_final_joined_MDM2_dependency_cn_df = correlation_MDM2_cn_filtered[, na_count <= 0]
+
+###Testing and training with MDM2 dependency!
+set.seed(123)
+no_na_final_joined_MDM2_dependency_cn_df_shuffled = no_na_final_joined_MDM2_dependency_cn_df[sample(1:nrow(no_na_final_joined_MDM2_dependency_cn_df)) ,]
+folds = cut(1:nrow(no_na_final_joined_MDM2_dependency_cn_df_shuffled), 3, FALSE)
+
+#First Round
+MDM2_cn_training1 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 1 | folds == 2 ,] #in folds 1 or 2
+MDM2_cn_testing1 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 3 ,]
+
+MDM2_y1 = MDM2_cn_training1$MDM2_Dep #dependent variable
+MDM2_x1 = as.matrix(select(MDM2_cn_training1, -MDM2_Dep)) #predictor variables
+MDM2_model1 = cv.glmnet(MDM2_x1, MDM2_y1)
+MDM2_model1_coef = as.matrix(coef(MDM2_model1))
+
+testing_MDM2_x1 = as.matrix(select(MDM2_cn_testing1, -MDM2_Dep))
+MDM2_cn_testing1$MDM2_Dep_prediction =  predict(MDM2_model1, testing_MDM2_x1) 
+MDM2_model1_eval = cor(MDM2_cn_testing1$MDM2_Dep_prediction, MDM2_cn_testing1$MDM2_Dep)
+
+MDM2_interesting_coef_1 = MDM2_model1_coef[MDM2_model1_coef[, 1] != 0  ,]
+
+#Second Round
+MDM2_cn_training2 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 1 | folds == 3 ,] #in folds 1 or 3
+MDM2_cn_testing2 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 2 ,]
+
+MDM2_y2 = MDM2_cn_training2$MDM2_Dep #dependent variable
+MDM2_x2 = as.matrix(select(MDM2_cn_training2, -MDM2_Dep)) #predictor variables
+MDM2_model2 = cv.glmnet(MDM2_x2, MDM2_y2)
+MDM2_model2_coef = as.matrix(coef(MDM2_model2))
+
+testing_MDM2_x2 = as.matrix(select(MDM2_cn_testing2, -MDM2_Dep))
+MDM2_cn_testing2$MDM2_Dep_prediction =  predict(MDM2_model2, testing_MDM2_x2) 
+MDM2_model2_eval = cor(MDM2_cn_testing2$MDM2_Dep_prediction, MDM2_cn_testing2$MDM2_Dep)
+
+MDM2_interesting_coef_2 = MDM2_model2_coef[MDM2_model2_coef[, 1] != 0  ,]
+
+#Third Round
+MDM2_cn_training3 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 2 | folds == 3 ,] #in folds 2 or 3
+MDM2_cn_testing3 = no_na_final_joined_MDM2_dependency_cn_df_shuffled[folds == 1 ,]
+
+MDM2_y3 = MDM2_cn_training3$MDM2_Dep #dependent variable
+MDM2_x3 = as.matrix(select(MDM2_cn_training3, -MDM2_Dep)) #predictor variables
+MDM2_model3 = cv.glmnet(MDM2_x3, MDM2_y3)
+MDM2_model3_coef = as.matrix(coef(MDM2_model3))
+
+testing_MDM2_x3 = as.matrix(select(MDM2_cn_testing3, -MDM2_Dep))
+MDM2_cn_testing3$MDM2_Dep_prediction =  predict(MDM2_model3, testing_MDM2_x3) 
+MDM2_model3_eval = cor(MDM2_cn_testing3$MDM2_Dep_prediction, MDM2_cn_testing3$MDM2_Dep)
+
+MDM2_interesting_coef_3 = MDM2_model3_coef[MDM2_model3_coef[, 1] != 0  ,]
+
+#printing out pearson correlations and coefficients
+MDM2_model1_eval
+MDM2_model2_eval
+MDM2_model3_eval
+MDM2_interesting_coef_1
+MDM2_interesting_coef_2
+MDM2_interesting_coef_3
+```
